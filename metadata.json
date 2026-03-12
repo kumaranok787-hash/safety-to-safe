@@ -1,0 +1,7 @@
+{
+  "name": "Remix: Indian Emergency Services Portal",
+  "description": "Access emergency services, report incidents, and stay informed with the Indian Emergency Portal. Features SOS button, health, education, women safety, and police services.",
+  "requestFramePermissions": [
+    "geolocation"
+  ]
+}
