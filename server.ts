@@ -7,7 +7,9 @@ import { fileURLToPath } from "url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-const db = new Database('cloud_db.sqlite');
+// Use /tmp for SQLite on Vercel since the main filesystem is read-only
+const dbPath = process.env.VERCEL ? '/tmp/cloud_db.sqlite' : 'cloud_db.sqlite';
+const db = new Database(dbPath);
 
 // Initialize database
 db.exec(`
@@ -18,110 +20,109 @@ db.exec(`
   )
 `);
 
-async function startServer() {
-  const app = express();
-  const PORT = 3000;
+const app = express();
+const PORT = 3000;
 
-  app.use(express.json());
+app.use(express.json());
 
-  // API routes
-  app.post("/api/nominatim/search", async (req, res) => {
-    try {
-      const { query, lat, lng } = req.body;
-      let places = [];
-      if (lat !== undefined && lng !== undefined) {
-        try {
-          // Create a bounding box around the location (~5-10km radius)
-          const left = lng - 0.05;
-          const right = lng + 0.05;
-          const top = lat + 0.05;
-          const bottom = lat - 0.05;
-          const viewbox = `${left},${top},${right},${bottom}`;
-          
-          const nomRes = await fetch(`https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(query)}&viewbox=${viewbox}&bounded=1&limit=10`, {
+// API routes
+app.post("/api/nominatim/search", async (req, res) => {
+  try {
+    const { query, lat, lng } = req.body;
+    let places = [];
+    if (lat !== undefined && lng !== undefined) {
+      try {
+        // Create a bounding box around the location (~5-10km radius)
+        const left = lng - 0.05;
+        const right = lng + 0.05;
+        const top = lat + 0.05;
+        const bottom = lat - 0.05;
+        const viewbox = `${left},${top},${right},${bottom}`;
+        
+        const nomRes = await fetch(`https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(query)}&viewbox=${viewbox}&bounded=1&limit=10`, {
+          headers: { 'User-Agent': 'EmergencyPortal/1.0 (kumaranok787@gmail.com)' }
+        });
+        let nomData = await nomRes.json();
+        
+        // If no results with bounded=1, try without it but still biased by viewbox
+        if (Array.isArray(nomData) && nomData.length === 0) {
+          const fallbackRes = await fetch(`https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(query)}&viewbox=${viewbox}&limit=10`, {
             headers: { 'User-Agent': 'EmergencyPortal/1.0 (kumaranok787@gmail.com)' }
           });
-          let nomData = await nomRes.json();
-          
-          // If no results with bounded=1, try without it but still biased by viewbox
-          if (Array.isArray(nomData) && nomData.length === 0) {
-            const fallbackRes = await fetch(`https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(query)}&viewbox=${viewbox}&limit=10`, {
-              headers: { 'User-Agent': 'EmergencyPortal/1.0 (kumaranok787@gmail.com)' }
-            });
-            nomData = await fallbackRes.json();
-          }
-          
-          if (Array.isArray(nomData)) {
-            places = nomData.map((place: any) => ({
-              title: place.display_name.split(',')[0],
-              address: place.display_name.split(',').slice(1, 4).join(',').replace(/^,/, '').trim(),
-              lat: parseFloat(place.lat),
-              lng: parseFloat(place.lon),
-              uri: `https://www.google.com/maps/dir/?api=1&destination=${place.lat},${place.lon}`
-            }));
-          } else {
-            console.error("Nominatim returned non-array data:", nomData);
-          }
-        } catch (e) {
-          console.error("Nominatim fetch error:", e);
+          nomData = await fallbackRes.json();
         }
+        
+        if (Array.isArray(nomData)) {
+          places = nomData.map((place: any) => ({
+            title: place.display_name.split(',')[0],
+            address: place.display_name.split(',').slice(1, 4).join(',').replace(/^,/, '').trim(),
+            lat: parseFloat(place.lat),
+            lng: parseFloat(place.lon),
+            uri: `https://www.google.com/maps/dir/?api=1&destination=${place.lat},${place.lon}`
+          }));
+        } else {
+          console.error("Nominatim returned non-array data:", nomData);
+        }
+      } catch (e) {
+        console.error("Nominatim fetch error:", e);
       }
-      res.json({ places });
-    } catch (error: any) {
-      console.error(error);
-      res.status(500).json({ error: error.message });
     }
-  });
+    res.json({ places });
+  } catch (error: any) {
+    console.error(error);
+    res.status(500).json({ error: error.message });
+  }
+});
 
-  // Cloud Sync API
-  app.post("/api/cloud/sync", (req, res) => {
-    try {
-      const { userId, encryptedPayload } = req.body;
-      if (!userId || !encryptedPayload) {
-        return res.status(400).json({ error: "Missing required fields" });
-      }
-
-      const stmt = db.prepare(`
-        INSERT INTO user_data (user_id, encrypted_payload, updated_at)
-        VALUES (?, ?, CURRENT_TIMESTAMP)
-        ON CONFLICT(user_id) DO UPDATE SET
-        encrypted_payload = excluded.encrypted_payload,
-        updated_at = CURRENT_TIMESTAMP
-      `);
-      
-      stmt.run(userId, encryptedPayload);
-      res.json({ success: true, message: "Data securely synced to cloud" });
-    } catch (error: any) {
-      console.error("Cloud sync error:", error);
-      res.status(500).json({ error: "Failed to sync data" });
+// Cloud Sync API
+app.post("/api/cloud/sync", (req, res) => {
+  try {
+    const { userId, encryptedPayload } = req.body;
+    if (!userId || !encryptedPayload) {
+      return res.status(400).json({ error: "Missing required fields" });
     }
-  });
 
-  app.get("/api/cloud/sync/:userId", (req, res) => {
-    try {
-      const { userId } = req.params;
-      const stmt = db.prepare("SELECT encrypted_payload FROM user_data WHERE user_id = ?");
-      const row = stmt.get(userId) as any;
-      
-      if (row) {
-        res.json({ success: true, encryptedPayload: row.encrypted_payload });
-      } else {
-        res.json({ success: false, message: "No cloud data found" });
-      }
-    } catch (error: any) {
-      console.error("Cloud fetch error:", error);
-      res.status(500).json({ error: "Failed to fetch data" });
+    const stmt = db.prepare(`
+      INSERT INTO user_data (user_id, encrypted_payload, updated_at)
+      VALUES (?, ?, CURRENT_TIMESTAMP)
+      ON CONFLICT(user_id) DO UPDATE SET
+      encrypted_payload = excluded.encrypted_payload,
+      updated_at = CURRENT_TIMESTAMP
+    `);
+    
+    stmt.run(userId, encryptedPayload);
+    res.json({ success: true, message: "Data securely synced to cloud" });
+  } catch (error: any) {
+    console.error("Cloud sync error:", error);
+    res.status(500).json({ error: "Failed to sync data" });
+  }
+});
+
+app.get("/api/cloud/sync/:userId", (req, res) => {
+  try {
+    const { userId } = req.params;
+    const stmt = db.prepare("SELECT encrypted_payload FROM user_data WHERE user_id = ?");
+    const row = stmt.get(userId) as any;
+    
+    if (row) {
+      res.json({ success: true, encryptedPayload: row.encrypted_payload });
+    } else {
+      res.json({ success: false, message: "No cloud data found" });
     }
-  });
+  } catch (error: any) {
+    console.error("Cloud fetch error:", error);
+    res.status(500).json({ error: "Failed to fetch data" });
+  }
+});
 
-  // Vite middleware for development
-  if (process.env.NODE_ENV !== "production") {
-    const vite = await createViteServer({
-      server: { 
-        middlewareMode: true
-      },
-      appType: "spa",
-    });
+// Vite middleware for development
+if (process.env.NODE_ENV !== "production") {
+  createViteServer({
+    server: { 
+      middlewareMode: true
+    },
+    appType: "spa",
+  }).then((vite) => {
     app.get('/', async (req, res) => {
       try {
         const url = req.originalUrl;
@@ -156,13 +157,18 @@ async function startServer() {
         res.status(500).end(e.message);
       }
     });
-  } else {
-    app.use(express.static('dist'));
-  }
+  });
+} else {
+  // In Vercel, static files are handled by vercel.json rewrites, 
+  // but we can leave this here for local production builds
+  app.use(express.static('dist'));
+}
 
+// Only start the server if not running in Vercel
+if (!process.env.VERCEL) {
   app.listen(PORT, "0.0.0.0", () => {
     console.log(`Server running on http://localhost:${PORT}`);
   });
 }
 
-startServer();
+export default app;
