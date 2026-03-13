@@ -1,24 +1,13 @@
 import express from "express";
 import { createServer as createViteServer } from "vite";
-import Database from "better-sqlite3";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-// Use /tmp for SQLite on Vercel since the main filesystem is read-only
-const dbPath = process.env.VERCEL ? '/tmp/cloud_db.sqlite' : 'cloud_db.sqlite';
-const db = new Database(dbPath);
-
-// Initialize database
-db.exec(`
-  CREATE TABLE IF NOT EXISTS user_data (
-    user_id TEXT PRIMARY KEY,
-    encrypted_payload TEXT NOT NULL,
-    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  )
-`);
+// In-memory store (for local dev - resets on restart)
+const memoryStore: Record<string, { encrypted_payload: string; updated_at: string }> = {};
 
 const app = express();
 const PORT = 3000;
@@ -74,23 +63,17 @@ app.post("/api/nominatim/search", async (req, res) => {
   }
 });
 
-// Cloud Sync API
+// Cloud Sync API (in-memory for local dev)
 app.post("/api/cloud/sync", (req, res) => {
   try {
     const { userId, encryptedPayload } = req.body;
     if (!userId || !encryptedPayload) {
       return res.status(400).json({ error: "Missing required fields" });
     }
-
-    const stmt = db.prepare(`
-      INSERT INTO user_data (user_id, encrypted_payload, updated_at)
-      VALUES (?, ?, CURRENT_TIMESTAMP)
-      ON CONFLICT(user_id) DO UPDATE SET
-      encrypted_payload = excluded.encrypted_payload,
-      updated_at = CURRENT_TIMESTAMP
-    `);
-    
-    stmt.run(userId, encryptedPayload);
+    memoryStore[userId] = {
+      encrypted_payload: encryptedPayload,
+      updated_at: new Date().toISOString()
+    };
     res.json({ success: true, message: "Data securely synced to cloud" });
   } catch (error: any) {
     console.error("Cloud sync error:", error);
@@ -101,9 +84,7 @@ app.post("/api/cloud/sync", (req, res) => {
 app.get("/api/cloud/sync/:userId", (req, res) => {
   try {
     const { userId } = req.params;
-    const stmt = db.prepare("SELECT encrypted_payload FROM user_data WHERE user_id = ?");
-    const row = stmt.get(userId) as any;
-    
+    const row = memoryStore[userId];
     if (row) {
       res.json({ success: true, encryptedPayload: row.encrypted_payload });
     } else {
